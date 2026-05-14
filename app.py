@@ -1,0 +1,938 @@
+import streamlit as st
+from fpdf import FPDF
+import pandas as pd
+import datetime
+import os
+
+# =========================================================
+# CONFIGURACION
+# =========================================================
+
+st.set_page_config(
+    page_title="TULSA - Cotizador Profesional",
+    page_icon="app/static/icon-192.png",
+    layout="wide"
+)
+
+# ── PWA: manifest + meta tags ─────────────────────
+st.markdown("""
+<link rel="manifest" href="app/static/manifest.json">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="TULSA">
+<link rel="apple-touch-icon" href="app/static/icon-192.png">
+<meta name="theme-color" content="#0D2B4E">
+""", unsafe_allow_html=True)
+
+# =========================================================
+# ESTADO
+# =========================================================
+
+# Valores por defecto de la sesion
+_DEFAULTS = {
+    "items":          [],
+    "ss_cliente":     "",
+    "ss_ubicacion":   "",
+    "ss_telefono":    "",
+    "ss_folio":       "TULSA-2024-001",
+    "ss_esquema":     0,
+    "ss_descuento":   10,
+    "ss_iva":         False,
+    "ss_viaticos":    False,
+    "ss_costo_viat":  0.0,
+    "ss_notas":       "",
+}
+for _k, _v in _DEFAULTS.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
+
+# =========================================================
+# ESTILOS
+# =========================================================
+
+st.markdown("""
+<style>
+
+.main {
+    background-color: #f4f6f8;
+}
+
+.stButton > button {
+    background-color: #0D2B4E;
+    color: white;
+    border-radius: 6px;
+    border: none;
+    font-weight: bold;
+    width: 100%;
+    height: 45px;
+    font-size: 15px;
+}
+
+.stButton > button:hover {
+    background-color: #00adef;
+    color: white;
+}
+
+</style>
+""", unsafe_allow_html=True)
+
+# =========================================================
+# COLORES
+# =========================================================
+
+NAVY       = (13,  43,  78)
+AZUL       = (0,  173, 239)
+GRIS_H     = (245, 247, 250)
+GRIS_BORDE = (210, 215, 220)
+VERDE      = (0,  160,  70)
+ROJO       = (190,  30,  45)
+NEGRO      = (35,   35,  35)
+GRIS_MED   = (100, 100, 100)
+
+# =========================================================
+# FUNCIONES
+# =========================================================
+
+def limpiar_texto(texto):
+    return str(texto).encode("latin-1", "replace").decode("latin-1")
+
+def money(valor):
+    return f"$ {valor:,.2f}"
+
+# =========================================================
+# PDF CLASS
+# =========================================================
+
+def escribir_justificado(pdf, h, texto, margen_izq=13, margen_der=200):
+    """
+    Escribe texto justificado usando cell() (sin auto-wrap de write).
+    - Primera linea: arranca desde pdf.get_x() actual.
+    - Lineas siguientes: desde margen_izq.
+    - Ultima linea: alineada a la izquierda.
+    """
+    palabras = texto.split()
+    if not palabras:
+        return
+
+    x_inicio    = pdf.get_x()
+    ancho_1ra   = margen_der - x_inicio
+    ancho_resto = margen_der - margen_izq
+
+    # ── Paso 1: armar lineas ──────────────────────────────
+    lineas       = []
+    linea_actual = []
+    ancho_actual = 0
+    primera      = True
+
+    for palabra in palabras:
+        aw    = ancho_1ra if primera else ancho_resto
+        w_pal = pdf.get_string_width(palabra)
+        w_sep = pdf.get_string_width(" ") if linea_actual else 0
+
+        if linea_actual and ancho_actual + w_sep + w_pal > aw:
+            lineas.append((linea_actual[:], aw, primera))
+            linea_actual = [palabra]
+            ancho_actual = w_pal
+            primera      = False
+        else:
+            if linea_actual:
+                ancho_actual += pdf.get_string_width(" ")
+            linea_actual.append(palabra)
+            ancho_actual += w_pal
+
+    if linea_actual:
+        lineas.append((linea_actual,
+                       ancho_1ra if primera else ancho_resto,
+                       primera))
+
+    # ── Paso 2: renderizar con cell() (posicion exacta) ──
+    for i, (pals, ancho_disp, es_primera) in enumerate(lineas):
+        es_ultima = (i == len(lineas) - 1)
+
+        if not es_primera:
+            pdf.set_x(margen_izq)
+
+        if es_ultima or len(pals) == 1:
+            # Ultima linea: cada palabra con su espacio normal
+            for j, pal in enumerate(pals):
+                w_pal = pdf.get_string_width(pal)
+                sep   = pdf.get_string_width(" ") if j < len(pals) - 1 else 0
+                pdf.cell(w_pal + sep, h, pal)
+        else:
+            # Linea justificada: distribuir espacio sobrante entre palabras
+            ancho_pals = sum(pdf.get_string_width(p) for p in pals)
+            gap = (ancho_disp - ancho_pals) / max(len(pals) - 1, 1)
+            for j, pal in enumerate(pals):
+                w_pal  = pdf.get_string_width(pal)
+                cell_w = w_pal + (gap if j < len(pals) - 1 else 0)
+                pdf.cell(cell_w, h, pal)
+
+        if not es_ultima:
+            pdf.ln(h)
+
+
+
+class PDF(FPDF):
+    pass
+
+# =========================================================
+# SIDEBAR
+# =========================================================
+
+with st.sidebar:
+
+    st.header("Informacion General")
+
+    # ── Cargar sesion ──────────────────────────────────
+    archivo_cargado = st.file_uploader(
+        "Cargar cotizacion (.json)",
+        type=["json"],
+        label_visibility="collapsed"
+    )
+    if archivo_cargado is not None:
+        # Usar file_id para evitar rerun en loop
+        file_id = archivo_cargado.file_id
+        if st.session_state.get("_ultimo_json") != file_id:
+            import json as _json
+            try:
+                datos = _json.loads(archivo_cargado.read().decode("utf-8"))
+                st.session_state["ss_cliente"]    = datos.get("cliente", "")
+                st.session_state["ss_ubicacion"]  = datos.get("ubicacion", "")
+                st.session_state["ss_telefono"]   = datos.get("telefono", "")
+                st.session_state["ss_folio"]      = datos.get("folio", "TULSA-2024-001")
+                st.session_state["ss_esquema"]    = datos.get("esquema_idx", 0)
+                st.session_state["ss_descuento"]  = datos.get("descuento_pct", 10)
+                st.session_state["ss_iva"]        = datos.get("iva_incluido", False)
+                st.session_state["ss_viaticos"]   = datos.get("cobrar_viaticos", False)
+                st.session_state["ss_costo_viat"] = datos.get("costo_viaticos", 0.0)
+                st.session_state["ss_notas"]      = datos.get("notas", "")
+                st.session_state["items"]         = datos.get("items", [])
+                if "fecha" in datos:
+                    try:
+                        st.session_state["ss_fecha"] = datetime.date.fromisoformat(datos["fecha"])
+                    except Exception:
+                        pass
+                st.session_state["_ultimo_json"] = file_id
+                st.success("Cotizacion cargada correctamente.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error al cargar: {e}")
+
+    st.divider()
+
+    cliente   = st.text_input("Cliente",   key="ss_cliente")
+    ubicacion = st.text_input("Domicilio", key="ss_ubicacion")
+    telefono  = st.text_input("Telefono",  key="ss_telefono")
+    folio     = st.text_input("Folio",     key="ss_folio")
+
+    if "ss_fecha" not in st.session_state:
+        st.session_state["ss_fecha"] = datetime.date.today()
+    fecha_hoy = st.date_input("Fecha", key="ss_fecha")
+
+    st.divider()
+
+    esquema_pago = st.radio(
+        "Esquema de pago",
+        options=["50/50  -  Piezas sueltas", "40/30/30  -  Obra integral"],
+        index=st.session_state["ss_esquema"],
+        key="ss_esquema_radio"
+    )
+    es_obra_integral = esquema_pago.startswith("40")
+
+    st.divider()
+
+    descuento_pct = st.number_input(
+        "Descuento (%)", min_value=0, max_value=100,
+        value=st.session_state["ss_descuento"], key="ss_descuento_inp"
+    )
+
+    iva_incluido    = st.checkbox("Desglosar IVA (16%)",
+                                  value=st.session_state["ss_iva"],
+                                  key="ss_iva_chk")
+    cobrar_viaticos = st.checkbox("Cobrar viaticos",
+                                  value=st.session_state["ss_viaticos"],
+                                  key="ss_viat_chk")
+
+    if cobrar_viaticos:
+        costo_viaticos = st.number_input(
+            "Costo de viaticos ($)", min_value=0.0, step=100.0,
+            value=st.session_state["ss_costo_viat"], key="ss_costo_inp"
+        )
+    else:
+        costo_viaticos = 0.0
+
+    st.divider()
+
+    notas = st.text_area(
+        "Notas / Aclaraciones (opcional)",
+        value=st.session_state["ss_notas"],
+        height=100,
+        key="ss_notas_area",
+        placeholder="Ej: Cliente acuerda anticipo del 25%. "
+                    "Se detectaron descuadres en vano de ventana cocina..."
+    )
+
+    st.divider()
+
+    # ── Guardar sesion ─────────────────────────────────
+    import json as _json
+    _sesion = {
+        "cliente":        cliente,
+        "ubicacion":      ubicacion,
+        "telefono":       telefono,
+        "folio":          folio,
+        "fecha":          fecha_hoy.isoformat(),
+        "esquema_idx":    0 if not es_obra_integral else 1,
+        "descuento_pct":  descuento_pct,
+        "iva_incluido":   iva_incluido,
+        "cobrar_viaticos":cobrar_viaticos,
+        "costo_viaticos": costo_viaticos,
+        "notas":          notas,
+        "items":          st.session_state["items"],
+    }
+    st.download_button(
+        label="Guardar sesion (.json)",
+        data=_json.dumps(_sesion, ensure_ascii=False, indent=2),
+        file_name=f"{folio}.json",
+        mime="application/json"
+    )
+
+# =========================================================
+# TITULO
+# =========================================================
+
+st.title("TULSA - Canceleria en Aluminio y Vidrio")
+st.write("Sistema profesional de generacion de cotizaciones.")
+
+# =========================================================
+# CAPTURA
+# =========================================================
+
+with st.container():
+
+    c1, c2, c3, c4 = st.columns([1, 4, 2, 2])
+
+    with c1:
+        cantidad = st.number_input("Cant.", min_value=1, value=1)
+
+    with c2:
+        descripcion = st.text_area("Descripcion", height=90)
+
+    with c3:
+        medidas = st.text_input("Medidas HxL", "100 x 100 cm")
+
+    with c4:
+        precio = st.number_input("Precio Unitario", min_value=0.0, step=100.0)
+
+    if st.button("AGREGAR CONCEPTO"):
+        if descripcion.strip() == "":
+            st.warning("Ingrese una descripcion.")
+        else:
+            import uuid as _uuid
+            st.session_state["items"].append({
+                "_id":         str(_uuid.uuid4()),  # ID estable para keys
+                "Cant":        cantidad,
+                "Descripcion": descripcion,
+                "Medidas":     medidas,
+                "PrecioUnit":  precio,
+                "Total":       cantidad * precio
+            })
+            st.rerun()
+
+# =========================================================
+# TABLA VISTA PREVIA
+# =========================================================
+
+if st.session_state["items"]:
+
+    st.divider()
+
+    # ── Tabla editable con eliminacion por fila ──
+    st.markdown("**Conceptos agregados** (puedes eliminar o editar cada fila):")
+
+    # Asegurar que todos los items tengan _id y PrecioUnit (compat. JSON viejo)
+    import uuid as _uuid
+    for _item in st.session_state["items"]:
+        if "_id" not in _item:
+            _item["_id"] = str(_uuid.uuid4())
+        if "PrecioUnit" not in _item:
+            _item["PrecioUnit"] = (_item["Total"] / _item["Cant"]
+                                   if _item["Cant"] else 0)
+
+    # Encabezados
+    h0, h1, h2, h3, h4, h5, h6 = st.columns([0.35, 0.5, 2.8, 1.4, 1.1, 1.1, 0.55])
+    h0.markdown("**#**")
+    h1.markdown("**Cant.**")
+    h2.markdown("**Descripcion**")
+    h3.markdown("**Medidas**")
+    h4.markdown("**P. Unit.**")
+    h5.markdown("**Total**")
+    h6.markdown("**Del.**")
+
+    idx_eliminar = None
+
+    for i, item in enumerate(st.session_state["items"]):
+        # Usar _id estable como key — evita el bug de valores cruzados al borrar
+        uid = item["_id"]
+        c0, c1, c2, c3, c4, c5, c6 = st.columns([0.35, 0.5, 2.8, 1.4, 1.1, 1.1, 0.55])
+        c0.markdown(f"{i + 1}")
+
+        nueva_cant = c1.number_input(
+            "", min_value=1, value=int(item["Cant"]),
+            key=f"cant_{uid}", label_visibility="collapsed"
+        )
+        nueva_desc = c2.text_input(
+            "", value=item.get("Descripcion", item.get("Descripci\xf3n", "")),
+            key=f"desc_{uid}", label_visibility="collapsed"
+        )
+        nuevas_med = c3.text_input(
+            "", value=item["Medidas"],
+            key=f"med_{uid}", label_visibility="collapsed"
+        )
+        nuevo_precio = c4.number_input(
+            "", min_value=0.0, step=100.0,
+            value=float(item["PrecioUnit"]),
+            key=f"precio_{uid}", label_visibility="collapsed"
+        )
+        nuevo_total = nueva_cant * nuevo_precio
+        c5.markdown(f"{money(nuevo_total)}")
+
+        # Actualizar si cambio algo
+        if (nueva_cant   != item["Cant"]
+                or nueva_desc  != item.get("Descripcion", item.get("Descripci\xf3n", ""))
+                or nuevas_med  != item["Medidas"]
+                or nuevo_precio != item["PrecioUnit"]):
+            st.session_state["items"][i]["Cant"]       = nueva_cant
+            st.session_state["items"][i]["Descripcion"]= nueva_desc
+            st.session_state["items"][i]["Medidas"]    = nuevas_med
+            st.session_state["items"][i]["PrecioUnit"] = nuevo_precio
+            st.session_state["items"][i]["Total"]      = nuevo_total
+
+        if c6.button("X", key=f"del_{uid}"):
+            idx_eliminar = i
+
+    if idx_eliminar is not None:
+        st.session_state["items"].pop(idx_eliminar)
+        st.rerun()
+
+    df = pd.DataFrame(st.session_state["items"])
+
+    subtotal_prev  = df["Total"].sum()
+    descuento_prev = subtotal_prev * (descuento_pct / 100)
+    subtotal_desc  = subtotal_prev - descuento_prev
+    base_iva_prev  = subtotal_desc + costo_viaticos
+    iva_prev       = base_iva_prev * 0.16
+
+    total_mostrar_prev = base_iva_prev
+    if iva_incluido:
+        total_mostrar_prev += iva_prev
+
+    st.markdown(f"### Subtotal: {money(subtotal_prev)}")
+    st.markdown(f"### Descuento: - {money(descuento_prev)}")
+    if cobrar_viaticos:
+        st.markdown(f"### Viaticos: {money(costo_viaticos)}")
+    if iva_incluido:
+        st.markdown(f"### IVA (16%): {money(iva_prev)}")
+    st.markdown(f"## Total Final: {money(total_mostrar_prev)}")
+
+    # =====================================================
+    # BOTONES
+    # =====================================================
+
+    b1, b2 = st.columns(2)
+
+    with b1:
+        if st.button("LIMPIAR LISTA"):
+            st.session_state["items"] = []
+            st.rerun()
+
+    with b2:
+        if st.button("GENERAR PDF PROFESIONAL"):
+            try:
+
+                pdf = PDF()
+                pdf.set_auto_page_break(auto=True, margin=15)
+                pdf.add_page()
+
+                # ─────────────────────────────────────────
+                # ENCABEZADO NAVY
+                # ─────────────────────────────────────────
+
+                HEADER_H = 45
+                pdf.set_fill_color(*NAVY)
+                pdf.rect(0, 0, 210, HEADER_H, "F")
+
+                # Logo centrado verticalmente en la franja
+                logo = "quita fonod.png"
+                if os.path.isfile(logo):
+                    try:
+                        LOGO_W    = 48     # mas grande
+                        LOGO_H_EST = 18    # proporcion aprox del logo TULSA
+                        logo_y = (HEADER_H - LOGO_H_EST) / 2
+                        pdf.image(logo, 10, logo_y, LOGO_W)
+                    except Exception:
+                        pass
+
+                # "COTIZACION" grande a la derecha
+                # O con acento: \xd3 = latin-1 para caracter O con acento
+                pdf.set_text_color(255, 255, 255)
+                pdf.set_font("Helvetica", "B", 28)
+                pdf.set_xy(0, 7)
+                pdf.cell(198, 12, "COTIZACI\xd3N", 0, 1, "R")
+
+                # Subtitulo
+                pdf.set_font("Helvetica", "", 10)
+                pdf.set_x(0)
+                pdf.cell(198, 6, "Canceler\xeda en Aluminio y Vidrio", 0, 1, "R")
+
+                # Folio y fecha
+                pdf.set_font("Helvetica", "", 9)
+                pdf.set_x(0)
+                pdf.cell(
+                    198, 6,
+                    f"Folio: {folio}  |  Fecha: {fecha_hoy.strftime('%d/%m/%Y')}",
+                    0, 1, "R"
+                )
+
+                # Linea separadora cyan bajo el header
+                pdf.set_draw_color(*AZUL)
+                pdf.set_line_width(0.8)
+                pdf.line(0, HEADER_H, 210, HEADER_H)
+                # Reset a gris para evitar que lineas navy
+                # del encabezado afecten la caja del cliente
+                pdf.set_draw_color(*GRIS_BORDE)
+                pdf.set_line_width(0.3)
+
+                # ─────────────────────────────────────────
+                # CAJA CLIENTE
+                # ─────────────────────────────────────────
+
+                pdf.ln(5)
+                box_y  = pdf.get_y()
+                PAD_V  = 3    # padding top/bottom
+                LINE_H = 5    # altura de cada renglon
+                box_h  = PAD_V + LINE_H + LINE_H + PAD_V  # siempre 2 renglones = 16
+                tiene_tel = telefono.strip() != ""
+
+                # Fondo, borde y barra izquierda
+                pdf.set_fill_color(*GRIS_H)
+                pdf.rect(10, box_y, 190, box_h, "F")
+                pdf.set_draw_color(*GRIS_BORDE)
+                pdf.rect(10, box_y, 190, box_h, "D")
+                pdf.set_fill_color(*NAVY)
+                pdf.rect(10, box_y, 3, box_h, "F")
+                pdf.set_draw_color(*GRIS_BORDE)
+
+                # Columna izquierda: CLIENTE + DOMICILIO
+                col_izq_lbl = 28   # ancho etiqueta
+                col_izq_val = 85   # ancho valor (hasta mitad de caja)
+
+                pdf.set_text_color(*NEGRO)
+                pdf.set_xy(16, box_y + PAD_V)
+                pdf.set_font("Helvetica", "B", 10)
+                pdf.cell(col_izq_lbl, LINE_H, "CLIENTE:", 0, 0)
+                pdf.set_font("Helvetica", "", 10)
+                pdf.cell(col_izq_val, LINE_H, limpiar_texto(cliente), 0, 1)
+
+                pdf.set_xy(16, box_y + PAD_V + LINE_H)
+                pdf.set_font("Helvetica", "B", 10)
+                pdf.cell(col_izq_lbl, LINE_H, "DOMICILIO:", 0, 0)
+                pdf.set_font("Helvetica", "", 10)
+                pdf.cell(col_izq_val, LINE_H, limpiar_texto(ubicacion), 0, 1)
+
+                # Columna derecha: TELÉFONO centrado verticalmente
+                if tiene_tel:
+                    tel_x   = 140   # x inicio columna derecha
+                    tel_lbl = 22
+                    tel_y   = box_y + (box_h - LINE_H) / 2  # centrado vertical
+                    pdf.set_xy(tel_x, tel_y)
+                    pdf.set_font("Helvetica", "B", 10)
+                    pdf.set_text_color(*NEGRO)
+                    pdf.cell(tel_lbl, LINE_H, "TEL\xc9FONO:", 0, 0)
+                    pdf.set_font("Helvetica", "", 10)
+                    pdf.cell(0, LINE_H, limpiar_texto(telefono), 0, 1)
+
+                # Mover cursor debajo de la caja con padding minimo
+                pdf.set_xy(10, box_y + box_h + 4)
+
+                # ─────────────────────────────────────────
+                # TABLA ENCABEZADO
+                # ─────────────────────────────────────────
+
+                col_cant = 12
+                col_desc = 118
+                col_med  = 30
+                col_imp  = 30
+                margen_x = 10
+
+                pdf.set_x(margen_x)
+                pdf.set_fill_color(*NAVY)
+                pdf.set_text_color(255, 255, 255)
+                pdf.set_font("Helvetica", "B", 9)
+                pdf.set_draw_color(*NAVY)
+
+                pdf.cell(col_cant, 9, "CANT.", 1, 0, "C", True)
+                pdf.cell(
+                    col_desc, 9,
+                    "DESCRIPCI\xd3N DE FABRICACI\xd3N / SERVICIO",
+                    1, 0, "C", True
+                )
+                pdf.cell(col_med, 9, "MEDIDAS HxL", 1, 0, "C", True)
+                pdf.cell(col_imp, 9, "IMPORTE",     1, 1, "C", True)
+
+                # ─────────────────────────────────────────
+                # TABLA FILAS
+                # ─────────────────────────────────────────
+
+                pdf.set_draw_color(*GRIS_BORDE)
+                pdf.set_text_color(*NEGRO)
+                pdf.set_font("Helvetica", "", 9)
+
+                subtotal = 0
+                fila_par = False
+
+                for item in st.session_state["items"]:
+
+                    desc = limpiar_texto(item.get("Descripcion", item.get("Descripción", "")))
+                    meds = limpiar_texto(item["Medidas"])
+
+                    # Medir con el mismo ancho que se usa al renderizar (col_desc-2)
+                    lineas   = pdf.multi_cell(col_desc - 2, 5, desc, split_only=True)
+                    n_lineas = len(lineas)
+                    # Padding: 2 arriba + 2 abajo; minimo 12mm
+                    altura   = max(12, n_lineas * 5 + 4)
+
+                    x = margen_x
+                    y = pdf.get_y()
+
+                    if y + altura > 260:
+                        pdf.add_page()
+                        y = pdf.get_y()
+
+                    fill_color = GRIS_H if fila_par else (255, 255, 255)
+                    pdf.set_fill_color(*fill_color)
+                    pdf.rect(
+                        x, y,
+                        col_cant + col_desc + col_med + col_imp,
+                        altura, "F"
+                    )
+                    fila_par = not fila_par
+
+                    pdf.set_draw_color(*GRIS_BORDE)
+
+                    # CANTIDAD
+                    pdf.set_xy(x, y)
+                    pdf.rect(x, y, col_cant, altura)
+                    pdf.set_font("Helvetica", "B", 9)
+                    pdf.multi_cell(col_cant, altura, str(item["Cant"]), 0, "C")
+
+                    # DESCRIPCION — centrado vertical uniforme
+                    alto_texto = n_lineas * 5
+                    y_desc     = y + (altura - alto_texto) / 2
+                    pdf.set_font("Helvetica", "", 9)
+                    pdf.rect(x + col_cant, y, col_desc, altura)  # borde primero
+                    pdf.set_xy(x + col_cant + 2, y_desc)
+                    pdf.multi_cell(col_desc - 2, 5, desc, 0, "J")
+
+                    # MEDIDAS
+                    pdf.set_xy(x + col_cant + col_desc, y)
+                    pdf.rect(x + col_cant + col_desc, y, col_med, altura)
+                    pdf.multi_cell(col_med, altura, meds, 0, "C")
+
+                    # IMPORTE
+                    pdf.set_xy(x + col_cant + col_desc + col_med, y)
+                    pdf.rect(x + col_cant + col_desc + col_med, y, col_imp, altura)
+                    pdf.multi_cell(col_imp, altura, money(item["Total"]), 0, "R")
+
+                    pdf.set_xy(x, y + altura)
+                    subtotal += item["Total"]
+
+                # ─────────────────────────────────────────
+                # TOTALES
+                # ─────────────────────────────────────────
+
+                descuento          = subtotal * (descuento_pct / 100)
+                subtotal_descuento = subtotal - descuento
+                base_iva           = subtotal_descuento + costo_viaticos
+                iva                = base_iva * 0.16
+                total_pdf = base_iva
+                if iva_incluido:
+                    total_pdf += iva
+
+                pdf.ln(5)
+                tot_x = 110
+                tot_w = 90
+                tot_y = pdf.get_y()
+
+                n_filas = 3
+                if iva_incluido:
+                    n_filas += 1
+                tot_h = n_filas * 8 + 20
+
+                pdf.set_fill_color(*GRIS_H)
+                pdf.rect(tot_x, tot_y, tot_w, tot_h, "F")
+
+                lbl_w = 50
+                val_x = tot_x + lbl_w
+                val_w = tot_w - lbl_w
+
+                def fila_total(label, valor,
+                               color_lbl=None, color_val=None, negrita=False):
+                    pdf.set_x(tot_x + 4)
+                    pdf.set_font("Helvetica", "B" if negrita else "", 10)
+                    pdf.set_text_color(*(color_lbl or NEGRO))
+                    pdf.cell(lbl_w - 4, 8, label, 0, 0, "L")
+                    pdf.set_x(val_x)
+                    pdf.set_font("Helvetica", "B" if negrita else "", 10)
+                    pdf.set_text_color(*(color_val or NEGRO))
+                    pdf.cell(val_w - 4, 8, valor, 0, 1, "R")
+
+                fila_total("SUBTOTAL:", money(subtotal), negrita=True)
+
+                fila_total(
+                    f"DESCUENTO ({descuento_pct}%):",
+                    f"- {money(descuento)}",
+                    color_lbl=ROJO, color_val=ROJO, negrita=True
+                )
+
+                # VIATICOS
+                cy = pdf.get_y()
+                pdf.set_x(tot_x + 4)
+                pdf.set_font("Helvetica", "B", 10)
+                pdf.set_text_color(*NEGRO)
+                pdf.cell(lbl_w - 4, 8, "VI\xc1TICOS:", 0, 0, "L")
+
+                if cobrar_viaticos:
+                    pdf.set_x(val_x)
+                    pdf.set_font("Helvetica", "", 10)
+                    pdf.set_text_color(*NEGRO)
+                    pdf.cell(val_w - 4, 8, money(costo_viaticos), 0, 1, "R")
+                else:
+                    pdf.set_x(val_x)
+                    pdf.set_font("Helvetica", "", 10)
+                    pdf.set_text_color(*NEGRO)
+                    pdf.cell(val_w - 30, 8, "$ 0.00", 0, 0, "R")
+                    badge_x = val_x + val_w - 28
+                    pdf.set_fill_color(*VERDE)
+                    pdf.rect(badge_x, cy + 1.5, 26, 5.5, "F")
+                    pdf.set_xy(badge_x, cy + 1)
+                    pdf.set_font("Helvetica", "B", 7)
+                    pdf.set_text_color(255, 255, 255)
+                    pdf.cell(26, 7, "CORTESIA", 0, 1, "C")
+
+                if iva_incluido:
+                    fila_total("I.V.A. (16%):", money(iva), negrita=True)
+
+                # Separador navy
+                sep_y = pdf.get_y()
+                pdf.set_draw_color(*NAVY)
+                pdf.set_line_width(0.5)
+                pdf.line(tot_x + 4, sep_y, tot_x + tot_w - 4, sep_y)
+                pdf.set_line_width(0.3)
+                pdf.set_draw_color(*GRIS_BORDE)
+                pdf.ln(2)
+
+                # TOTAL FINAL
+                pdf.set_x(tot_x + 4)
+                pdf.set_font("Helvetica", "B", 13)
+                pdf.set_text_color(*NAVY)
+                pdf.cell(lbl_w - 4, 9, "TOTAL FINAL:", 0, 0, "L")
+                pdf.set_x(val_x)
+                pdf.set_font("Helvetica", "B", 14)
+                pdf.cell(val_w - 4, 9, money(total_pdf), 0, 1, "R")
+
+                pdf.set_x(val_x)
+                pdf.set_font("Helvetica", "B", 10)
+                pdf.set_text_color(*GRIS_MED)
+                pdf.cell(val_w - 4, 6, "MXN", 0, 1, "R")
+
+                # Anticipo requerido (depende del esquema)
+                if es_obra_integral:
+                    pct_anticipo   = 0.40
+                    txt_esquema    = "40% anticipo + 30% inicio inst. + 30% al terminar"
+                else:
+                    pct_anticipo   = 0.50
+                    txt_esquema    = "50% anticipo + 50% al concluir instalaci\xf3n"
+
+                monto_anticipo = total_pdf * pct_anticipo
+
+                pdf.ln(3)
+                antic_y = pdf.get_y()
+                # Fondo azul claro
+                pdf.set_fill_color(*AZUL)
+                pdf.rect(tot_x, antic_y, tot_w, 14, "F")
+                # Linea 1: etiqueta + monto
+                pdf.set_xy(tot_x + 4, antic_y + 1.5)
+                pdf.set_font("Helvetica", "B", 8)
+                pdf.set_text_color(255, 255, 255)
+                pdf.cell(tot_w - 8, 5,
+                         f"Anticipo para iniciar fabricaci\xf3n: {money(monto_anticipo)}",
+                         0, 1, "C")
+                # Linea 2: esquema
+                pdf.set_x(tot_x + 4)
+                pdf.set_font("Helvetica", "", 7)
+                pdf.set_text_color(220, 235, 255)
+                pdf.cell(tot_w - 8, 5, txt_esquema, 0, 1, "C")
+
+                # ─────────────────────────────────────────
+                # NOTAS / ACLARACIONES (si existen)
+                # ─────────────────────────────────────────
+
+                if notas and notas.strip():
+                    pdf.ln(8)
+                    nota_y = pdf.get_y()
+
+                    # Encabezado de la seccion notas
+                    pdf.set_fill_color(*GRIS_H)
+                    pdf.rect(10, nota_y, 190, 7, "F")
+                    pdf.set_fill_color(*AZUL)
+                    pdf.rect(10, nota_y, 3, 7, "F")
+                    pdf.set_xy(16, nota_y + 1)
+                    pdf.set_font("Helvetica", "B", 9)
+                    pdf.set_text_color(*NAVY)
+                    pdf.cell(0, 5, "Notas / Aclaraciones:", 0, 1)
+
+                    # Texto de las notas
+                    pdf.ln(2)
+                    pdf.set_x(14)
+                    pdf.set_font("Helvetica", "", 9)
+                    pdf.set_text_color(*NEGRO)
+                    pdf.multi_cell(186, 5, limpiar_texto(notas.strip()))
+
+                # ─────────────────────────────────────────
+                # TERMINOS Y CONDICIONES
+                # ─────────────────────────────────────────
+
+                pdf.ln(10)
+                pdf.set_draw_color(*GRIS_BORDE)
+                pdf.set_line_width(0.4)
+                pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+                pdf.ln(4)
+
+                pdf.set_text_color(*GRIS_MED)
+                pdf.set_font("Helvetica", "B", 7)
+                pdf.cell(0, 4, "T\xe9rminos y Condiciones (TULSA)", 0, 1)
+                pdf.ln(1)
+
+                # Texto de pagos segun esquema seleccionado
+                if es_obra_integral:
+                    texto_pagos = (
+                        "40% de anticipo al cierre del trato para inicio de fabricaci\xf3n; "
+                        "30% al arranque de la instalaci\xf3n; "
+                        "30% restante a la conclusi\xf3n y aceptaci\xf3n de los trabajos."
+                    )
+                else:
+                    texto_pagos = (
+                        "50% de anticipo al cierre del trato para inicio de fabricaci\xf3n; "
+                        "50% restante a la conclusi\xf3n de la instalaci\xf3n."
+                    )
+
+                condiciones = [
+                    (
+                        "Vigencia:",
+                        "La presente cotizaci\xf3n tiene una validez de 5 d\xedas h\xe1biles "
+                        "a partir de la fecha de emisi\xf3n. Transcurrido este plazo, "
+                        "los precios estar\xe1n sujetos a revisi\xf3n seg\xfan disponibilidad "
+                        "de materiales y costos vigentes."
+                    ),
+                    (
+                        "Pagos:",
+                        texto_pagos
+                    ),
+                    (
+                        "Tiempos de entrega:",
+                        "Vidrio templado: 7-20 d\xedas h\xe1biles adicionales. "
+                        "Aluminio en acabados especiales (sublimados o colores especiales): "
+                        "15-30 d\xedas h\xe1biles adicionales, sujeto a disponibilidad de planta."
+                    ),
+                    (
+                        "Instalaciones ocultas:",
+                        "El cliente debe se\xf1alar f\xedsicamente el paso de "
+                        "tuber\xedas, cableado o instalaciones ocultas antes de iniciar. "
+                        "TULSA queda liberado de toda responsabilidad civil y econ\xf3mica "
+                        "por da\xf1os en instalaciones no se\xf1alizadas."
+                    ),
+                    (
+                        "Curado y sellado:",
+                        "El sil\xedc\xf3n requiere 24-48 horas de curado. "
+                        "No limpiar, tocar ni mojar las juntas durante este periodo. "
+                        "TULSA no responde por filtraciones derivadas del incumplimiento "
+                        "de esta indicaci\xf3n por parte del cliente o terceros."
+                    ),
+                    (
+                        "Garant\xeda:",
+                        "3 meses limitada en herrajes, fabricaci\xf3n y estanqueidad, "
+                        "desde la fecha de entrega. Excluye da\xf1os por uso inadecuado, "
+                        "manipulaci\xf3n por personal ajeno a TULSA, factores externos "
+                        "o estructura deficiente en la obra civil."
+                    ),
+                    (
+                        "Aceptaci\xf3n:",
+                        "El pago del anticipo constituye la aceptaci\xf3n total e "
+                        "incondicional de los presentes T\xe9rminos y Condiciones, "
+                        "con el mismo valor legal que una firma aut\xf3grafa conforme "
+                        "al C\xf3digo de Comercio y el C\xf3digo Civil Federal."
+                    ),
+                ]
+
+                for etiqueta, texto in condiciones:
+                    # Si quedan menos de 10mm libres, nueva pagina
+                    if pdf.get_y() + 10 > (297 - 15):
+                        pdf.add_page()
+                    cy = pdf.get_y()
+                    # Bullet cuadrado gris discreto
+                    pdf.set_fill_color(*GRIS_MED)
+                    pdf.rect(10, cy + 1.4, 1.4, 1.4, "F")
+                    # Label en negrita con cell() (no auto-wrap)
+                    pdf.set_xy(13, cy)
+                    pdf.set_font("Helvetica", "B", 6)
+                    pdf.set_text_color(*GRIS_MED)
+                    w_label = pdf.get_string_width(etiqueta + " ")
+                    pdf.cell(w_label, 3.8, etiqueta + " ")
+                    # Texto justificado corrido desde donde quedo el label
+                    pdf.set_font("Helvetica", "", 6)
+                    pdf.set_text_color(90, 90, 90)
+                    escribir_justificado(pdf, 3.8, texto,
+                                        margen_izq=13, margen_der=200)
+                    pdf.ln(3.5)  # separacion entre items
+
+                # ─────────────────────────────────────────
+                # GRACIAS
+                # ─────────────────────────────────────────
+
+                pdf.ln(4)
+                # Asegurar espacio suficiente; si no, nueva pagina
+                if pdf.get_y() + 16 > (297 - 15):
+                    pdf.add_page()
+                gracias_y = pdf.get_y()
+                pdf.set_auto_page_break(False)
+                pdf.set_fill_color(*NAVY)
+                pdf.rect(10, gracias_y, 190, 12, "F")
+                pdf.set_xy(10, gracias_y + 2)
+                pdf.set_font("Helvetica", "B", 11)
+                pdf.set_text_color(255, 255, 255)
+                pdf.cell(190, 8, "\xa1Gracias por su confianza!", 0, 1, "C")
+                pdf.set_auto_page_break(True, margin=15)
+
+                # ─────────────────────────────────────────
+                # EXPORTAR
+                # ─────────────────────────────────────────
+
+                nombre_archivo = f"Cotizacion_{folio}.pdf"
+                pdf_bytes = pdf.output(dest="S").encode("latin-1")
+
+                st.success(f"Cotizacion {folio} generada correctamente.")
+
+                st.download_button(
+                    label="DESCARGAR PDF",
+                    data=pdf_bytes,
+                    file_name=nombre_archivo,
+                    mime="application/pdf"
+                )
+
+            except Exception as e:
+                st.error(f"Error al generar PDF:\n\n{e}")
+
+else:
+    st.info("Agrega conceptos para comenzar.")
